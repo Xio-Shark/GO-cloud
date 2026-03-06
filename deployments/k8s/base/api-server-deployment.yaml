@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  namespace: go-cloud
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api-server
+  template:
+    metadata:
+      labels:
+        app: api-server
+    spec:
+      containers:
+        - name: api-server
+          image: ghcr.io/example/go-cloud-api-server:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - name: HTTP_ADDR
+              value: ":8080"
+            - name: MYSQL_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: go-cloud-secret
+                  key: MYSQL_DSN
+            - name: REDIS_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: go-cloud-config
+                  key: REDIS_ADDR
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: go-cloud-secret
+                  key: REDIS_PASSWORD
+            - name: REDIS_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: go-cloud-config
+                  key: REDIS_DB
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: go-cloud-config
+                  key: LOG_LEVEL
+            - name: GITOPS_OVERLAYS_ROOT
+              value: deployments/k8s/overlays
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080

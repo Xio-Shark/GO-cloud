@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  namespace: go-cloud
+spec:
+  template:
+    spec:
+      containers:
+        - name: api-server
+          image: ghcr.io/example/go-cloud-api-server:0.1.0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scheduler
+  namespace: go-cloud
+spec:
+  template:
+    spec:
+      containers:
+        - name: scheduler
+          image: ghcr.io/example/go-cloud-scheduler:0.1.0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: go-cloud
+spec:
+  template:
+    spec:
+      containers:
+        - name: worker
+          image: ghcr.io/example/go-cloud-worker:0.1.0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notifier
+  namespace: go-cloud
+spec:
+  template:
+    spec:
+      containers:
+        - name: notifier
+          image: ghcr.io/example/go-cloud-notifier:0.1.0

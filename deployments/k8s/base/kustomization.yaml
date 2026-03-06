@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secret.yaml
+  - serviceaccount.yaml
+  - role.yaml
+  - rolebinding.yaml
+  - api-server-deployment.yaml
+  - api-server-service.yaml
+  - scheduler-deployment.yaml
+  - scheduler-service.yaml
+  - worker-deployment.yaml
+  - worker-service.yaml
+  - notifier-deployment.yaml
+  - notifier-service.yaml
+  - ingress.yaml
+  - hpa-worker.yaml

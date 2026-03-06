@@ -1,0 +1,15 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: go-cloud
+  namespace: argocd
+spec:
+  description: Go cloud task platform
+  sourceRepos:
+    - https://github.com/example/go-cloud.git
+  destinations:
+    - namespace: go-cloud
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: "*"

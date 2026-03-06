@@ -1,0 +1,53 @@
+CREATE TABLE IF NOT EXISTS tasks (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  name VARCHAR(128) NOT NULL,
+  description VARCHAR(255) NOT NULL DEFAULT '',
+  task_type VARCHAR(32) NOT NULL,
+  schedule_type VARCHAR(32) NOT NULL,
+  cron_expr VARCHAR(64) DEFAULT NULL,
+  payload JSON DEFAULT NULL,
+  timeout_seconds INT NOT NULL DEFAULT 60,
+  retry_times INT NOT NULL DEFAULT 0,
+  status VARCHAR(32) NOT NULL DEFAULT 'active',
+  callback_url VARCHAR(255) DEFAULT NULL,
+  created_by VARCHAR(64) NOT NULL DEFAULT '',
+  updated_by VARCHAR(64) NOT NULL DEFAULT '',
+  last_run_time DATETIME DEFAULT NULL,
+  next_run_time DATETIME DEFAULT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_status_next_run (status, next_run_time)
+);
+
+CREATE TABLE IF NOT EXISTS task_executions (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  task_id BIGINT NOT NULL,
+  execution_no VARCHAR(64) NOT NULL,
+  trigger_type VARCHAR(32) NOT NULL,
+  worker_id VARCHAR(64) NOT NULL DEFAULT '',
+  status VARCHAR(32) NOT NULL,
+  start_time DATETIME DEFAULT NULL,
+  end_time DATETIME DEFAULT NULL,
+  duration_ms BIGINT NOT NULL DEFAULT 0,
+  retry_count INT NOT NULL DEFAULT 0,
+  exit_code INT DEFAULT NULL,
+  error_message TEXT,
+  output_log MEDIUMTEXT,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_execution_no (execution_no),
+  INDEX idx_task_id (task_id),
+  INDEX idx_status_created_at (status, created_at)
+);
+
+CREATE TABLE IF NOT EXISTS release_records (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  app_name VARCHAR(64) NOT NULL,
+  version VARCHAR(128) NOT NULL,
+  environment VARCHAR(32) NOT NULL,
+  status VARCHAR(32) NOT NULL,
+  operator VARCHAR(64) NOT NULL DEFAULT '',
+  change_log TEXT,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);

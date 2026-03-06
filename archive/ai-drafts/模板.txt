@@ -1,0 +1,13 @@
+基于我们当前已经确定的目录结构和代码风格，继续补 notifier 机制。
+
+本轮目标：
+- 增加 notifier service 与 webhook notifier
+- 在 worker 执行完成后触发通知
+- 先支持 success / failed 两种状态
+- 保持现有 repository / service / bootstrap 风格一致
+
+输出要求：
+- 先列新增 / 修改文件
+- 给完整代码骨架
+- 说明和 worker_service 的衔接点
+- 说明当前实现的边界，不要假装全部完成

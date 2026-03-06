@@ -1,0 +1,1168 @@
+下面继续补这三块：
+
+* `scheduler main/service`
+* `retry 机制`
+* `Prometheus metrics 骨架`
+
+目标是把你的系统从“能手动触发”推进到“更像线上服务”：
+
+**cron 扫描 → 自动派发 → worker 执行 → 失败重试 → 指标暴露**
+
+我会尽量保持和你前面的代码风格一致。
+
+---
+
+# 一、这次要新增的文件
+
+```text id="zd2qte"
+cmd/scheduler/main.go
+
+internal/service/scheduler_service.go
+internal/service/scheduler_service_impl.go
+
+internal/metrics/http_metrics.go
+internal/metrics/scheduler_metrics.go
+internal/metrics/worker_metrics.go
+internal/metrics/registry.go
+
+internal/repository/redis/lock_repo.go
+
+internal/transport/http/handler/metrics_handler.go   # 可选，实际上可以继续放 health_handler 里
+```
+
+另外，你现有的一些文件也需要小改：
+
+* `internal/repository/interfaces.go`
+* `internal/service/worker_service_impl.go`
+* `internal/service/task_service_impl.go`
+* `internal/transport/http/handler/health_handler.go`
+* `internal/bootstrap/app.go`
+* `cmd/worker/main.go`
+
+---
+
+# 二、scheduler 设计思路
+
+`scheduler` 的职责是：
+
+1. 周期扫描数据库里到期任务
+2. 用分布式锁避免重复派发
+3. 生成 `execution` 记录
+4. 推入 Redis 队列
+5. 更新 `last_run_time` / `next_run_time`
+
+你这个项目里，最适合先做一个**轮询式 scheduler**，不要一开始就上太复杂的事件驱动。
+
+---
+
+# 三、先补 repository 接口：Lock
+
+## `internal/repository/interfaces.go`
+
+把 `LockRepository` 保留并真正实现：
+
+```go id="pjlwm7"
+type LockRepository interface {
+	Acquire(ctx context.Context, key string, value string, ttl time.Duration) (bool, error)
+	Release(ctx context.Context, key string, value string) error
+}
+```
+
+这个你前面已经有定义了，这里不改接口，只补实现。
+
+---
+
+# 四、Redis 分布式锁
+
+## `internal/repository/redis/lock_repo.go`
+
+这个版本先做一个简单可用版。
+用 `SETNX + TTL` 获取锁，释放时做“值比对后删除”。
+
+```go id="tiy6w8"
+package redis
+
+import (
+	"context"
+	"time"
+
+	goredis "github.com/redis/go-redis/v9"
+
+	"go-job-platform/internal/repository"
+)
+
+type LockRepository struct {
+	rdb *goredis.Client
+}
+
+func NewLockRepository(rdb *goredis.Client) repository.LockRepository {
+	return &LockRepository{rdb: rdb}
+}
+
+func (r *LockRepository) Acquire(ctx context.Context, key string, value string, ttl time.Duration) (bool, error) {
+	return r.rdb.SetNX(ctx, key, value, ttl).Result()
+}
+
+func (r *LockRepository) Release(ctx context.Context, key string, value string) error {
+	const lua = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+	return redis.call("DEL", KEYS[1])
+else
+	return 0
+end
+`
+	return r.rdb.Eval(ctx, lua, []string{key}, value).Err()
+}
+```
+
+---
+
+# 五、scheduler service 接口
+
+## `internal/service/scheduler_service.go`
+
+```go id="2uh8in"
+package service
+
+import "context"
+
+type SchedulerService interface {
+	Run(ctx context.Context) error
+	DispatchDueTasks(ctx context.Context, limit int) (int, error)
+}
+```
+
+---
+
+# 六、scheduler service 实现
+
+## `internal/service/scheduler_service_impl.go`
+
+这里会做这些事：
+
+* 周期扫描
+* 找到 due tasks
+* 给每个任务加 dispatch lock
+* 创建 execution 记录
+* 推队列
+* 更新 next_run_time
+
+为了不引入太多外部依赖，cron 表达式计算可以先用 `robfig/cron/v3`。
+
+## 先说明依赖
+
+你需要安装：
+
+```bash
+go get github.com/robfig/cron/v3
+go get github.com/google/uuid
+```
+
+## 代码
+
+```go id="w6db8g"
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/robfig/cron/v3"
+
+	"go-job-platform/internal/domain"
+	"go-job-platform/internal/metrics"
+	"go-job-platform/internal/queue"
+	"go-job-platform/internal/repository"
+)
+
+type schedulerService struct {
+	taskRepo      repository.TaskRepository
+	executionRepo repository.ExecutionRepository
+	queueRepo     repository.QueueRepository
+	lockRepo      repository.LockRepository
+
+	scanInterval time.Duration
+	dispatchTTL  time.Duration
+}
+
+func NewSchedulerService(
+	taskRepo repository.TaskRepository,
+	executionRepo repository.ExecutionRepository,
+	queueRepo repository.QueueRepository,
+	lockRepo repository.LockRepository,
+	scanInterval time.Duration,
+) SchedulerService {
+	if scanInterval <= 0 {
+		scanInterval = 5 * time.Second
+	}
+
+	return &schedulerService{
+		taskRepo:      taskRepo,
+		executionRepo: executionRepo,
+		queueRepo:     queueRepo,
+		lockRepo:      lockRepo,
+		scanInterval:  scanInterval,
+		dispatchTTL:   30 * time.Second,
+	}
+}
+
+func (s *schedulerService) Run(ctx context.Context) error {
+	ticker := time.NewTicker(s.scanInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			count, err := s.DispatchDueTasks(ctx, 20)
+			if err != nil {
+				log.Printf("dispatch due tasks failed: %v", err)
+				continue
+			}
+			log.Printf("scheduler dispatched %d tasks", count)
+		}
+	}
+}
+
+func (s *schedulerService) DispatchDueTasks(ctx context.Context, limit int) (int, error) {
+	now := time.Now()
+
+	tasks, err := s.taskRepo.ListDueTasks(ctx, now, limit)
+	if err != nil {
+		return 0, err
+	}
+
+	metrics.SchedulerScansTotal.Inc()
+	metrics.SchedulerDueTasks.Set(float64(len(tasks)))
+
+	dispatched := 0
+
+	for _, task := range tasks {
+		lockKey := fmt.Sprintf("lock:dispatch:task:%d", task.ID)
+		lockValue := uuid.NewString()
+
+		locked, err := s.lockRepo.Acquire(ctx, lockKey, lockValue, s.dispatchTTL)
+		if err != nil {
+			log.Printf("acquire dispatch lock failed, task_id=%d err=%v", task.ID, err)
+			continue
+		}
+		if !locked {
+			metrics.SchedulerDuplicateBlockedTotal.Inc()
+			continue
+		}
+
+		func() {
+			defer func() {
+				_ = s.lockRepo.Release(ctx, lockKey, lockValue)
+			}()
+
+			executionNo := fmt.Sprintf("exec_%d_%s", time.Now().Unix(), uuid.NewString()[:8])
+			execution := &domain.TaskExecution{
+				TaskID:      task.ID,
+				ExecutionNo: executionNo,
+				TriggerType: domain.TriggerTypeScheduler,
+				Status:      domain.ExecutionStatusPending,
+				CreatedAt:   time.Now(),
+				UpdatedAt:   time.Now(),
+			}
+
+			if err := s.executionRepo.Create(ctx, execution); err != nil {
+				log.Printf("create execution failed, task_id=%d err=%v", task.ID, err)
+				return
+			}
+
+			msg := queue.TaskMessage{
+				TaskID:      task.ID,
+				ExecutionNo: executionNo,
+				TriggerType: string(domain.TriggerTypeScheduler),
+				TriggerBy:   "scheduler",
+			}
+
+			raw, err := json.Marshal(msg)
+			if err != nil {
+				log.Printf("marshal queue message failed, task_id=%d err=%v", task.ID, err)
+				return
+			}
+
+			if err := s.queueRepo.EnqueueTask(ctx, raw); err != nil {
+				log.Printf("enqueue task failed, task_id=%d err=%v", task.ID, err)
+				return
+			}
+
+			lastRun := now
+			nextRun, err := calcNextRunTime(task, now)
+			if err != nil {
+				log.Printf("calc next run time failed, task_id=%d err=%v", task.ID, err)
+			}
+
+			if err := s.taskRepo.UpdateNextRunTime(ctx, task.ID, &lastRun, nextRun); err != nil {
+				log.Printf("update next_run_time failed, task_id=%d err=%v", task.ID, err)
+				return
+			}
+
+			dispatched++
+			metrics.SchedulerDispatchedTasksTotal.Inc()
+		}()
+	}
+
+	return dispatched, nil
+}
+
+func calcNextRunTime(task domain.Task, now time.Time) (*time.Time, error) {
+	switch task.ScheduleType {
+	case domain.ScheduleTypeManual:
+		return nil, nil
+	case domain.ScheduleTypeOnce:
+		// 一次性任务：跑完即不再调度
+		return nil, nil
+	case domain.ScheduleTypeCron:
+		if task.CronExpr == nil || *task.CronExpr == "" {
+			return nil, nil
+		}
+		parser := cron.NewParser(
+			cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor,
+		)
+		sched, err := parser.Parse(*task.CronExpr)
+		if err != nil {
+			return nil, err
+		}
+		next := sched.Next(now)
+		return &next, nil
+	default:
+		return nil, nil
+	}
+}
+```
+
+---
+
+# 七、scheduler main
+
+## `cmd/scheduler/main.go`
+
+```go id="sxrnew"
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"gorm.io/gorm"
+	goredis "github.com/redis/go-redis/v9"
+
+	"go-job-platform/internal/bootstrap"
+	mysqlrepo "go-job-platform/internal/repository/mysql"
+	redisrepo "go-job-platform/internal/repository/redis"
+	"go-job-platform/internal/service"
+)
+
+func main() {
+	cfg := bootstrap.LoadConfig()
+
+	db, err := bootstrap.NewMySQL(cfg)
+	if err != nil {
+		log.Fatalf("init mysql failed: %v", err)
+	}
+
+	rdb, err := bootstrap.NewRedis(cfg)
+	if err != nil {
+		log.Fatalf("init redis failed: %v", err)
+	}
+
+	schedulerSvc := buildSchedulerService(db, rdb)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log.Println("scheduler starting")
+
+	if err := schedulerSvc.Run(ctx); err != nil && err != context.Canceled {
+		log.Fatalf("scheduler exited with error: %v", err)
+	}
+
+	log.Println("scheduler exited")
+}
+
+func buildSchedulerService(db *gorm.DB, rdb *goredis.Client) service.SchedulerService {
+	taskRepo := mysqlrepo.NewTaskRepository(db)
+	executionRepo := mysqlrepo.NewExecutionRepository(db)
+	queueRepo := redisrepo.NewQueueRepository(rdb)
+	lockRepo := redisrepo.NewLockRepository(rdb)
+
+	scanInterval := 5 * time.Second
+	if v := os.Getenv("SCHEDULER_SCAN_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			scanInterval = d
+		}
+	}
+
+	return service.NewSchedulerService(
+		taskRepo,
+		executionRepo,
+		queueRepo,
+		lockRepo,
+		scanInterval,
+	)
+}
+```
+
+这里别忘了 `import "os"`。
+
+完整 import 版如下：
+
+```go id="rdgn9x"
+import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+    ...
+)
+```
+
+---
+
+# 八、retry 机制设计
+
+先给你一个**够用、不复杂**的 retry 方案：
+
+## 当前规则
+
+* worker 执行失败后
+* 查任务的 `retry_times`
+* 如果当前 `retry_count < retry_times`
+* 创建新的 retry 消息，推到 `retry queue` 或者仍推主队列
+* 触发类型设为 `retry`
+
+你现在的表里已经有 `retry_count` 字段，所以完全够用。
+
+---
+
+# 九、给 queue message 增加 retry_count
+
+## `internal/queue/task_message.go`
+
+把它改成：
+
+```go id="t6svl1"
+package queue
+
+type TaskMessage struct {
+	TaskID      int64  `json:"task_id"`
+	ExecutionNo string `json:"execution_no"`
+	TriggerType string `json:"trigger_type"`
+	TriggerBy   string `json:"trigger_by"`
+	RetryCount  int    `json:"retry_count"`
+}
+```
+
+---
+
+# 十、补 execution repo 的 retry 更新支持
+
+你现在的 `ExecutionRepository` 需要加一个方法，便于创建重试执行记录时带 `retry_count`。
+
+其实最简单的办法不是改老接口，而是**直接 Create 新 execution** 时把 `RetryCount` 写进去。
+
+所以这里不强制改接口，只要求你在创建 retry execution 时正确设置 `RetryCount` 即可。
+
+---
+
+# 十一、修改 worker service，加入 retry 逻辑
+
+## `internal/service/worker_service_impl.go`
+
+这里给你**完整替换版**，把 retry 逻辑和 metrics 一起接进来。
+
+```go id="aijmyc"
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"log"
+	"time"
+
+	"github.com/google/uuid"
+
+	"go-job-platform/internal/domain"
+	"go-job-platform/internal/executor"
+	"go-job-platform/internal/metrics"
+	"go-job-platform/internal/queue"
+	"go-job-platform/internal/repository"
+)
+
+type workerService struct {
+	taskRepo      repository.TaskRepository
+	executionRepo repository.ExecutionRepository
+	queueRepo     repository.QueueRepository
+	cacheRepo     repository.CacheRepository
+	executors     []executor.Executor
+	workerID      string
+	pollTimeout   time.Duration
+}
+
+func NewWorkerService(
+	taskRepo repository.TaskRepository,
+	executionRepo repository.ExecutionRepository,
+	queueRepo repository.QueueRepository,
+	cacheRepo repository.CacheRepository,
+	executors []executor.Executor,
+	workerID string,
+) WorkerService {
+	return &workerService{
+		taskRepo:      taskRepo,
+		executionRepo: executionRepo,
+		queueRepo:     queueRepo,
+		cacheRepo:     cacheRepo,
+		executors:     executors,
+		workerID:      workerID,
+		pollTimeout:   5 * time.Second,
+	}
+}
+
+func (s *workerService) ConsumeLoop(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		raw, err := s.queueRepo.DequeueTask(ctx, s.pollTimeout)
+		if err != nil {
+			log.Printf("dequeue task error: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		if len(raw) == 0 {
+			continue
+		}
+
+		metrics.WorkerConsumedTasksTotal.Inc()
+
+		if err := s.HandleOneMessage(ctx, raw, s.workerID); err != nil {
+			log.Printf("handle task message error: %v", err)
+		}
+	}
+}
+
+func (s *workerService) HandleOneMessage(ctx context.Context, raw []byte, workerID string) error {
+	var msg queue.TaskMessage
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return err
+	}
+
+	task, err := s.taskRepo.GetByID(ctx, msg.TaskID)
+	if err != nil {
+		return err
+	}
+	if task == nil {
+		return errors.New("task not found")
+	}
+	if task.Status != domain.TaskStatusActive {
+		return errors.New("task is not active")
+	}
+
+	if err := s.executionRepo.UpdateStatus(ctx, msg.ExecutionNo, domain.ExecutionStatusRunning, workerID); err != nil {
+		return err
+	}
+	_ = s.cacheRepo.SetExecutionStatus(ctx, msg.ExecutionNo, string(domain.ExecutionStatusRunning), 30*time.Minute)
+	metrics.WorkerRunningTasksGauge.Inc()
+	defer metrics.WorkerRunningTasksGauge.Dec()
+
+	exec := s.pickExecutor(task.TaskType)
+	if exec == nil {
+		errMsg := "unsupported task type"
+		exitCode := -1
+		metrics.WorkerFailedTasksTotal.Inc()
+		return s.executionRepo.Finish(
+			ctx,
+			msg.ExecutionNo,
+			domain.ExecutionStatusFailed,
+			0,
+			&exitCode,
+			&errMsg,
+			nil,
+		)
+	}
+
+	timeout := task.TimeoutSeconds
+	if timeout <= 0 {
+		timeout = 60
+	}
+
+	execCtx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	result := exec.Execute(execCtx, *task)
+	durationMs := time.Since(start).Milliseconds()
+	metrics.WorkerExecutionDurationMs.Observe(float64(durationMs))
+
+	finalStatus := domain.ExecutionStatusSuccess
+	if execCtx.Err() == context.DeadlineExceeded {
+		finalStatus = domain.ExecutionStatusTimeout
+		timeoutMsg := "execution timeout"
+		result.ErrMsg = &timeoutMsg
+	} else if result.ErrMsg != nil {
+		finalStatus = domain.ExecutionStatusFailed
+	}
+
+	output := result.OutputLog
+	if err := s.executionRepo.Finish(
+		ctx,
+		msg.ExecutionNo,
+		finalStatus,
+		durationMs,
+		result.ExitCode,
+		result.ErrMsg,
+		&output,
+	); err != nil {
+		return err
+	}
+
+	_ = s.cacheRepo.SetExecutionStatus(ctx, msg.ExecutionNo, string(finalStatus), 24*time.Hour)
+
+	switch finalStatus {
+	case domain.ExecutionStatusSuccess:
+		metrics.WorkerSucceededTasksTotal.Inc()
+	case domain.ExecutionStatusFailed, domain.ExecutionStatusTimeout:
+		metrics.WorkerFailedTasksTotal.Inc()
+		if err := s.tryRetry(ctx, *task, msg); err != nil {
+			log.Printf("retry enqueue failed, execution_no=%s err=%v", msg.ExecutionNo, err)
+		}
+	}
+
+	return nil
+}
+
+func (s *workerService) tryRetry(ctx context.Context, task domain.Task, msg queue.TaskMessage) error {
+	if msg.RetryCount >= task.RetryTimes {
+		return nil
+	}
+
+	newExecutionNo := "exec_retry_" + uuid.NewString()[:12]
+	nextRetryCount := msg.RetryCount + 1
+
+	execution := &domain.TaskExecution{
+		TaskID:      task.ID,
+		ExecutionNo: newExecutionNo,
+		TriggerType: domain.TriggerTypeRetry,
+		Status:      domain.ExecutionStatusPending,
+		RetryCount:  nextRetryCount,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+
+	if err := s.executionRepo.Create(ctx, execution); err != nil {
+		return err
+	}
+
+	retryMsg := queue.TaskMessage{
+		TaskID:      task.ID,
+		ExecutionNo: newExecutionNo,
+		TriggerType: string(domain.TriggerTypeRetry),
+		TriggerBy:   "worker-retry",
+		RetryCount:  nextRetryCount,
+	}
+
+	raw, err := json.Marshal(retryMsg)
+	if err != nil {
+		return err
+	}
+
+	metrics.WorkerRetriedTasksTotal.Inc()
+	return s.queueRepo.EnqueueRetryTask(ctx, raw)
+}
+
+func (s *workerService) pickExecutor(taskType domain.TaskType) executor.Executor {
+	for _, e := range s.executors {
+		if e.Supports(taskType) {
+			return e
+		}
+	}
+	return nil
+}
+```
+
+---
+
+# 十二、让 retry queue 真的被消费
+
+你现在的 `QueueRepository` 只有 `DequeueTask` 消费主队列。
+要让 retry 生效，最简单的有两种做法：
+
+## 方案 A
+
+`EnqueueRetryTask` 直接也推主队列。
+最简单。
+
+## 方案 B
+
+单独再写个 `DequeueRetryTask`，worker 轮询两个队列。
+稍复杂。
+
+你现在建议直接上 **方案 A**，省很多代码。
+
+---
+
+## 改 `internal/repository/redis/queue_repo.go`
+
+把 `EnqueueRetryTask` 改成直接进主队列：
+
+```go id="934om0"
+func (r *QueueRepository) EnqueueRetryTask(ctx context.Context, msg []byte) error {
+	return r.rdb.LPush(ctx, taskQueueKey, msg).Err()
+}
+```
+
+这样就够了。
+
+---
+
+# 十三、Prometheus metrics 骨架
+
+你现在需要 4 类指标：
+
+* HTTP 请求指标
+* scheduler 指标
+* worker 指标
+* readiness/health 自身不一定单独记
+
+## 安装依赖
+
+```bash
+go get github.com/prometheus/client_golang/prometheus
+go get github.com/prometheus/client_golang/prometheus/promhttp
+```
+
+---
+
+# 十四、metrics 注册文件
+
+## `internal/metrics/registry.go`
+
+```go id="54fwen"
+package metrics
+
+import "github.com/prometheus/client_golang/prometheus"
+
+var Registry = prometheus.NewRegistry()
+
+func MustRegisterAll() {
+	Registry.MustRegister(
+		HTTPRequestsTotal,
+		HTTPRequestDuration,
+		SchedulerScansTotal,
+		SchedulerDueTasks,
+		SchedulerDispatchedTasksTotal,
+		SchedulerDuplicateBlockedTotal,
+		WorkerConsumedTasksTotal,
+		WorkerSucceededTasksTotal,
+		WorkerFailedTasksTotal,
+		WorkerRetriedTasksTotal,
+		WorkerRunningTasksGauge,
+		WorkerExecutionDurationMs,
+	)
+}
+```
+
+---
+
+# 十五、HTTP metrics
+
+## `internal/metrics/http_metrics.go`
+
+```go id="xjvc78"
+package metrics
+
+import "github.com/prometheus/client_golang/prometheus"
+
+var HTTPRequestsTotal = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "job_platform_http_requests_total",
+		Help: "Total number of HTTP requests",
+	},
+	[]string{"method", "path", "status"},
+)
+
+var HTTPRequestDuration = prometheus.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    "job_platform_http_request_duration_seconds",
+		Help:    "HTTP request duration in seconds",
+		Buckets: prometheus.DefBuckets,
+	},
+	[]string{"method", "path"},
+)
+```
+
+---
+
+# 十六、scheduler metrics
+
+## `internal/metrics/scheduler_metrics.go`
+
+```go id="jgajis"
+package metrics
+
+import "github.com/prometheus/client_golang/prometheus"
+
+var SchedulerScansTotal = prometheus.NewCounter(
+	prometheus.CounterOpts{
+		Name: "job_platform_scheduler_scans_total",
+		Help: "Total number of scheduler scan rounds",
+	},
+)
+
+var SchedulerDueTasks = prometheus.NewGauge(
+	prometheus.GaugeOpts{
+		Name: "job_platform_scheduler_due_tasks",
+		Help: "Number of due tasks found in current scan",
+	},
+)
+
+var SchedulerDispatchedTasksTotal = prometheus.NewCounter(
+	prometheus.CounterOpts{
+		Name: "job_platform_scheduler_dispatched_tasks_total",
+		Help: "Total number of dispatched tasks",
+	},
+)
+
+var SchedulerDuplicateBlockedTotal = prometheus.NewCounter(
+	prometheus.CounterOpts{
+		Name: "job_platform_scheduler_duplicate_blocked_total",
+		Help: "Total number of duplicate dispatches blocked by distributed lock",
+	},
+)
+```
+
+---
+
+# 十七、worker metrics
+
+## `internal/metrics/worker_metrics.go`
+
+```go id="0ig60x"
+package metrics
+
+import "github.com/prometheus/client_golang/prometheus"
+
+var WorkerConsumedTasksTotal = prometheus.NewCounter(
+	prometheus.CounterOpts{
+		Name: "job_platform_worker_consumed_tasks_total",
+		Help: "Total number of consumed task messages",
+	},
+)
+
+var WorkerSucceededTasksTotal = prometheus.NewCounter(
+	prometheus.CounterOpts{
+		Name: "job_platform_worker_succeeded_tasks_total",
+		Help: "Total number of successfully executed tasks",
+	},
+)
+
+var WorkerFailedTasksTotal = prometheus.NewCounter(
+	prometheus.CounterOpts{
+		Name: "job_platform_worker_failed_tasks_total",
+		Help: "Total number of failed or timed-out tasks",
+	},
+)
+
+var WorkerRetriedTasksTotal = prometheus.NewCounter(
+	prometheus.CounterOpts{
+		Name: "job_platform_worker_retried_tasks_total",
+		Help: "Total number of retried tasks",
+	},
+)
+
+var WorkerRunningTasksGauge = prometheus.NewGauge(
+	prometheus.GaugeOpts{
+		Name: "job_platform_worker_running_tasks",
+		Help: "Current number of running tasks in worker",
+	},
+)
+
+var WorkerExecutionDurationMs = prometheus.NewHistogram(
+	prometheus.HistogramOpts{
+		Name:    "job_platform_worker_execution_duration_ms",
+		Help:    "Task execution duration in milliseconds",
+		Buckets: []float64{10, 50, 100, 200, 500, 1000, 3000, 5000, 10000, 30000},
+	},
+)
+```
+
+---
+
+# 十八、把 metrics 接进 HTTP 服务
+
+最简单方式是继续在 `health_handler.go` 里改 `/metrics`。
+
+## 改 `internal/transport/http/handler/health_handler.go`
+
+把 `Metrics` 方法改成这样：
+
+```go id="efw6zu"
+package handler
+
+import (
+	"context"
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"gorm.io/gorm"
+	goredis "github.com/redis/go-redis/v9"
+
+	"go-job-platform/internal/bootstrap"
+)
+
+type HealthHandler struct {
+	cfg bootstrap.Config
+	db  *gorm.DB
+	rdb *goredis.Client
+}
+
+func NewHealthHandler(cfg bootstrap.Config, db *gorm.DB, rdb *goredis.Client) *HealthHandler {
+	return &HealthHandler{
+		cfg: cfg,
+		db:  db,
+		rdb: rdb,
+	}
+}
+
+func (h *HealthHandler) Healthz(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"code":    0,
+		"message": "success",
+		"data": gin.H{
+			"app":    h.cfg.AppName,
+			"env":    h.cfg.AppEnv,
+			"status": "ok",
+		},
+	})
+}
+
+func (h *HealthHandler) Readyz(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	defer cancel()
+
+	if err := pingMySQL(ctx, h.db); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"code":    50301,
+			"message": "mysql not ready",
+			"data":    err.Error(),
+		})
+		return
+	}
+
+	if err := h.rdb.Ping(ctx).Err(); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"code":    50302,
+			"message": "redis not ready",
+			"data":    err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code":    0,
+		"message": "success",
+		"data": gin.H{"status": "ready"},
+	})
+}
+
+func (h *HealthHandler) Metrics(c *gin.Context) {
+	promhttp.Handler().ServeHTTP(c.Writer, c.Request)
+}
+
+func pingMySQL(ctx context.Context, db *gorm.DB) error {
+	sqlDB, err := db.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.PingContext(ctx)
+}
+```
+
+---
+
+# 十九、可选：HTTP 中间件统计请求指标
+
+这一步很加分，但不是刚需。
+你可以给 Gin 加个 middleware。
+
+## 新增 `internal/transport/http/middleware/metrics.go`
+
+```go id="7hypnm"
+package middleware
+
+import (
+	"strconv"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"go-job-platform/internal/metrics"
+)
+
+func PrometheusMetrics() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		c.Next()
+
+		status := strconv.Itoa(c.Writer.Status())
+		path := c.FullPath()
+		if path == "" {
+			path = "unknown"
+		}
+
+		metrics.HTTPRequestsTotal.WithLabelValues(c.Request.Method, path, status).Inc()
+		metrics.HTTPRequestDuration.WithLabelValues(c.Request.Method, path).Observe(time.Since(start).Seconds())
+	}
+}
+```
+
+## 然后改 router
+
+在 `router.go` 里加：
+
+```go id="1hlvzv"
+r.Use(middleware.PrometheusMetrics())
+```
+
+你需要 import 对应 middleware 包。
+
+---
+
+# 二十、记得在 main 里注册 metrics
+
+你需要在 `api-server`、`worker`、`scheduler` 启动时注册指标。
+
+## 改 `cmd/api-server/main.go`
+
+在 `main()` 开头加：
+
+```go id="s2g6yn"
+metrics.MustRegisterAll()
+```
+
+完整导入要加：
+
+```go id="ka0l01"
+import "go-job-platform/internal/metrics"
+```
+
+---
+
+## 改 `cmd/worker/main.go`
+
+同样加：
+
+```go id="2ul7o5"
+metrics.MustRegisterAll()
+```
+
+---
+
+## 改 `cmd/scheduler/main.go`
+
+也加：
+
+```go id="rb7muf"
+metrics.MustRegisterAll()
+```
+
+---
+
+# 二十一、你现在系统的完整主链路
+
+到这里为止，你的项目已经有：
+
+## API 层
+
+* 创建任务
+* 查询任务
+* 更新任务
+* 手动触发
+* 查询 execution
+* 查询日志
+* healthz / readyz / metrics
+
+## Scheduler
+
+* 周期扫描到期任务
+* 分布式锁去重
+* 自动派发 execution
+* 更新 next_run_time
+
+## Worker
+
+* 拉取队列消息
+* 按 task type 选择 executor
+* shell / http 执行
+* 写 execution 结果
+* 失败后自动 retry
+
+## Metrics
+
+* HTTP 请求数与耗时
+* scheduler 扫描与派发
+* worker 执行成功/失败/重试/耗时
+
+这已经是一个很像样的**云原生调度平台 V1.5** 了。
+
+---
+
+# 二十二、当前最值得补的几个点
+
+按优先级看：
+
+## 第一优先级
+
+把 scheduler 的 `next_run_time` 初始化逻辑补上。
+不然 cron 任务创建后第一次可能没有触发时间。
+
+## 第二优先级
+
+给 worker 增加 notifier / callback。
+任务执行完成后回调 `callback_url`。
+
+## 第三优先级
+
+加单元测试：
+
+* `calcNextRunTime`
+* `pickExecutor`
+* `TaskService.TriggerTask`
+* `WorkerService.tryRetry`
+
+## 第四优先级
+
+把 `/metrics` 接到 Prometheus ServiceMonitor 或 scrape config。
+
+---
+
+# 二十三、现在最适合继续补什么
+
+现在最合理的下一步不是再铺更多模块，而是把**缺口补平**。
+我建议下一条直接做这三个之一：
+
+1. **创建任务时自动初始化 `next_run_time` + scheduler 首次调度逻辑**
+2. **callback/notifier 机制骨架**
+3. **Go 单元测试骨架 + mock repository 方案**
+
+最有价值的是第 1 个，因为它能把 cron 任务链路彻底打通。

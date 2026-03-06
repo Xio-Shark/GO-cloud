@@ -1,0 +1,18 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: go-cloud-dev
+  namespace: argocd
+spec:
+  project: go-cloud
+  source:
+    repoURL: https://github.com/example/go-cloud.git
+    targetRevision: main
+    path: deployments/k8s/overlays/dev
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: go-cloud
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

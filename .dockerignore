@@ -1,0 +1,9 @@
+.git
+.idea
+.vscode
+dist
+coverage
+archive
+deployments/k8s
+deployments/argocd
+docs

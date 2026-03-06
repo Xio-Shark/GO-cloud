@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: go-cloud
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      serviceAccountName: go-cloud-worker
+      containers:
+        - name: worker
+          image: ghcr.io/example/go-cloud-worker:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9092
+          env:
+            - name: ADMIN_ADDR
+              value: ":9092"
+            - name: MYSQL_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: go-cloud-secret
+                  key: MYSQL_DSN
+            - name: REDIS_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: go-cloud-config
+                  key: REDIS_ADDR
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: go-cloud-secret
+                  key: REDIS_PASSWORD
+            - name: REDIS_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: go-cloud-config
+                  key: REDIS_DB
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: go-cloud-config
+                  key: LOG_LEVEL
+            - name: QUEUE_POP_TIMEOUT
+              valueFrom:
+                configMapKeyRef:
+                  name: go-cloud-config
+                  key: QUEUE_POP_TIMEOUT
+            - name: EXECUTOR_HTTP_TIMEOUT
+              valueFrom:
+                configMapKeyRef:
+                  name: go-cloud-config
+                  key: EXECUTOR_HTTP_TIMEOUT
+            - name: KUBERNETES_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: go-cloud-config
+                  key: KUBERNETES_NAMESPACE
+            - name: CONTAINER_JOB_POLL_INTERVAL
+              valueFrom:
+                configMapKeyRef:
+                  name: go-cloud-config
+                  key: CONTAINER_JOB_POLL_INTERVAL
+            - name: CONTAINER_JOB_TTL_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: go-cloud-config
+                  key: CONTAINER_JOB_TTL_SECONDS
+            - name: CONTAINER_JOB_IMAGE_PULL_POLICY
+              valueFrom:
+                configMapKeyRef:
+                  name: go-cloud-config
+                  key: CONTAINER_JOB_IMAGE_PULL_POLICY
+            - name: CONTAINER_JOB_SERVICE_ACCOUNT
+              valueFrom:
+                configMapKeyRef:
+                  name: go-cloud-config
+                  key: CONTAINER_JOB_SERVICE_ACCOUNT
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 9092
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9092

@@ -1,0 +1,23 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: go-cloud
+  namespace: go-cloud
+spec:
+  groups:
+    - name: go-cloud.rules
+      rules:
+        - alert: GoCloudWorkerFailureSpike
+          expr: increase(go_cloud_worker_failed_tasks_total[10m]) > 5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: worker 失败数在 10 分钟内超过 5 次
+        - alert: GoCloudAPIServer5xx
+          expr: increase(go_cloud_http_requests_total{status_code=~"5.."}[10m]) > 3
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: api-server 10 分钟内 5xx 超过 3 次

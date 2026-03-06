@@ -1,0 +1,22 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: go-cloud
+  namespace: go-cloud
+spec:
+  selector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - api-server
+          - scheduler
+          - worker
+          - notifier
+  namespaceSelector:
+    matchNames:
+      - go-cloud
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
